@@ -1,0 +1,776 @@
+import requests
+import time
+import sqlite3
+import threading
+import random
+import logging
+from datetime import datetime
+from typing import List, Optional, Set
+
+# ============================================================
+# Configuration
+# ============================================================
+TOKENS = [
+    "8875028414:AAHsh0z-gg0z0NTdh5hVLngsGRg9Tyis8Z0",
+    "8609309680:AAE0jnlw8rEBjDh_GSa5NJ95glnmtXUhU0A",
+    "8958238724:AAFdtyNs8ytwK5DBC6EAi3IVxW8KeyOwUqc",
+    "8986987388:AAE2j1-mgmzh1u_moGbB0CyadCIpDYpb1Pc",
+    "8605096171:AAGs5NklpciZWgFB9xJ_lUCHke1Ly_zr7rk"
+]
+OWNER_ID = 6958892160
+DB_FILE = "infinity.db"
+DEFAULT_DELAY = 1.0
+DEFAULT_TAG = "Enemy"
+
+# ============================================================
+# Logging Setup
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger(__name__)
+
+# ============================================================
+# Database Layer (Thread-Safe & Optimized)
+# ============================================================
+class Database:
+    def __init__(self, db_file: str):
+        self.db_file = db_file
+        self._lock = threading.Lock()
+        self._init_tables()
+
+    def _get_conn(self):
+        return sqlite3.connect(self.db_file, check_same_thread=False)
+
+    def _init_tables(self):
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.executescript("""
+                CREATE TABLE IF NOT EXISTS targets (
+                    user_id INTEGER PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS insults (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text TEXT UNIQUE NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS enemies (
+                    user_id INTEGER PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS admins (
+                    user_id INTEGER PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS gifs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id TEXT UNIQUE NOT NULL
+                );
+            """)
+            conn.commit()
+            conn.close()
+        log.info("Database initialized.")
+
+    # --- Settings ---
+    def get_setting(self, key: str, default: str = None) -> Optional[str]:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = c.fetchone()
+            conn.close()
+            return row[0] if row else default
+
+    def set_setting(self, key: str, value: str):
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, value))
+            conn.commit()
+            conn.close()
+
+    # --- Targets ---
+    def add_target(self, user_id: int) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            try:
+                c.execute("INSERT OR IGNORE INTO targets VALUES (?)", (user_id,))
+                added = c.rowcount > 0
+                conn.commit()
+                return added
+            finally:
+                conn.close()
+
+    def remove_target(self, user_id: int) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("DELETE FROM targets WHERE user_id = ?", (user_id,))
+            deleted = c.rowcount > 0
+            conn.commit()
+            conn.close()
+            return deleted
+
+    def clear_targets(self):
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("DELETE FROM targets")
+            conn.commit()
+            conn.close()
+
+    def get_targets(self) -> List[int]:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM targets")
+            result = [row[0] for row in c.fetchall()]
+            conn.close()
+            return result
+
+    # --- Insults ---
+    def add_insult(self, text: str) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            try:
+                c.execute("INSERT OR IGNORE INTO insults (text) VALUES (?)", (text.strip(),))
+                added = c.rowcount > 0
+                conn.commit()
+                return added
+            finally:
+                conn.close()
+
+    def add_insults_bulk(self, texts: List[str]) -> int:
+        added = 0
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            for text in texts:
+                clean_text = text.strip()
+                if not clean_text:
+                    continue
+                try:
+                    c.execute("INSERT OR IGNORE INTO insults (text) VALUES (?)", (clean_text,))
+                    if c.rowcount > 0:
+                        added += 1
+                except Exception:
+                    pass
+            conn.commit()
+            conn.close()
+        return added
+
+    def get_insults(self) -> List[str]:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("SELECT text FROM insults")
+            result = [row[0] for row in c.fetchall()]
+            conn.close()
+            return result
+
+    def clear_insults(self):
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("DELETE FROM insults")
+            conn.commit()
+            conn.close()
+
+    # --- Enemies ---
+    def add_enemy(self, user_id: int) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            try:
+                c.execute("INSERT OR IGNORE INTO enemies VALUES (?)", (user_id,))
+                added = c.rowcount > 0
+                conn.commit()
+                return added
+            finally:
+                conn.close()
+
+    def remove_enemy(self, user_id: int) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("DELETE FROM enemies WHERE user_id = ?", (user_id,))
+            deleted = c.rowcount > 0
+            conn.commit()
+            conn.close()
+            return deleted
+
+    def get_enemies(self) -> List[int]:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM enemies")
+            result = [row[0] for row in c.fetchall()]
+            conn.close()
+            return result
+
+    def is_enemy(self, user_id: int) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM enemies WHERE user_id = ?", (user_id,))
+            result = c.fetchone()
+            conn.close()
+            return result is not None
+
+    # --- Admins ---
+    def add_admin(self, user_id: int) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            try:
+                c.execute("INSERT OR IGNORE INTO admins VALUES (?)", (user_id,))
+                added = c.rowcount > 0
+                conn.commit()
+                return added
+            finally:
+                conn.close()
+
+    def remove_admin(self, user_id: int) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+            deleted = c.rowcount > 0
+            conn.commit()
+            conn.close()
+            return deleted
+
+    def get_admins(self) -> List[int]:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM admins")
+            result = [row[0] for row in c.fetchall()]
+            conn.close()
+            return result
+
+    def is_admin(self, user_id: int) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,))
+            result = c.fetchone()
+            conn.close()
+            return result is not None
+
+    # --- Gifs ---
+    def add_gif(self, file_id: str) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            try:
+                c.execute("INSERT OR IGNORE INTO gifs (file_id) VALUES (?)", (file_id,))
+                added = c.rowcount > 0
+                conn.commit()
+                return added
+            finally:
+                conn.close()
+
+    def get_gifs(self) -> List[str]:
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("SELECT file_id FROM gifs")
+            result = [row[0] for row in c.fetchall()]
+            conn.close()
+            return result
+
+    def clear_gifs(self):
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            c.execute("DELETE FROM gifs")
+            conn.commit()
+            conn.close()
+
+db = Database(DB_FILE)
+
+# ============================================================
+# Bot Core Logic
+# ============================================================
+class MasterBot:
+    def __init__(self):
+        self.tag_symbol = db.get_setting("tag", DEFAULT_TAG)
+        self.delay = float(db.get_setting("delay", DEFAULT_DELAY))
+        self.active_attacks: Set[int] = set()
+        self.active_gif_attacks: Set[int] = set()
+        self.reply_targets: dict = {}
+        self.gif_reply_targets: dict = {}
+        self.attack_lock = threading.Lock()
+        self.enemy_cooldown: dict = {}
+        self.cooldown_lock = threading.Lock()
+        self.enemy_event = threading.Event()
+        self.enemy_data = None
+        self.enemy_data_lock = threading.Lock()
+        log.info(f"MasterBot initialized. Tag: {self.tag_symbol}, Delay: {self.delay}s")
+
+    # --- Utility ---
+    def _api_call(self, method: str, token: str, data: dict, files: dict = None) -> Optional[dict]:
+        try:
+            url = f"https://api.telegram.org/bot{token}/{method}"
+            response = requests.post(url, data=data, files=files, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:
+                retry_after = response.json().get('parameters', {}).get('retry_after', 2)
+                time.sleep(retry_after)
+                return self._api_call(method, token, data, files)
+            else:
+                return None
+        except:
+            return None
+
+    def send_msg(self, token: str, chat_id: int, text: str, reply_id: int = None, parse_mode: str = "Markdown") -> bool:
+        data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
+        if reply_id:
+            data["reply_to_message_id"] = reply_id
+        result = self._api_call("sendMessage", token, data)
+        return result is not None and result.get("ok", False)
+
+    def send_gif(self, token: str, chat_id: int, file_id: str, reply_id: int = None) -> bool:
+        data = {"chat_id": chat_id, "animation": file_id}
+        if reply_id:
+            data["reply_to_message_id"] = reply_id
+        result = self._api_call("sendAnimation", token, data)
+        return result is not None and result.get("ok", False)
+
+    def download_file_content(self, token: str, file_id: str) -> Optional[str]:
+        get_file = self._api_call("getFile", token, {"file_id": file_id})
+        if not get_file or not get_file.get("ok"):
+            return None
+        file_path = get_file["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+        try:
+            response = requests.get(file_url, timeout=30)
+            return response.text if response.status_code == 200 else None
+        except:
+            return None
+
+    def _is_authorized(self, user_id: int) -> bool:
+        return user_id == OWNER_ID or db.is_admin(user_id)
+
+    # --- Enemy Auto-Attack ---
+    def _enemy_worker(self, token: str):
+        while True:
+            self.enemy_event.wait()
+            with self.enemy_data_lock:
+                if self.enemy_data:
+                    chat_id, enemy_id, msg_id = self.enemy_data
+                else:
+                    self.enemy_event.clear()
+                    continue
+            insults = db.get_insults()
+            if insults:
+                insult = random.choice(insults)
+                self.send_msg(token, chat_id, insult, reply_id=msg_id)
+            self.enemy_event.clear()
+
+    def _trigger_enemy_attack(self, chat_id: int, enemy_id: int, msg_id: int):
+        with self.cooldown_lock:
+            now = time.time()
+            last = self.enemy_cooldown.get(enemy_id, 0)
+            if now - last < 1:
+                return
+            self.enemy_cooldown[enemy_id] = now
+        with self.enemy_data_lock:
+            self.enemy_data = (chat_id, enemy_id, msg_id)
+        self.enemy_event.set()
+
+    # --- Attack Logic ---
+    def _attack_worker(self, token: str, chat_id: int):
+        while chat_id in self.active_attacks:
+            targets = db.get_targets()
+            insults = db.get_insults()
+            if not targets or not insults:
+                time.sleep(0.05)
+                continue
+            insult = random.choice(insults)
+            tags = " ".join([f"[{self.tag_symbol}](tg://user?id={uid})" for uid in targets])
+            full_msg = f"{insult}\n{tags}"
+            reply_id = self.reply_targets.get(chat_id, None)
+            self.send_msg(token, chat_id, full_msg, reply_id=reply_id)
+            time.sleep(self.delay)
+
+    # --- GIF Attack Logic ---
+    def _gif_attack_worker(self, token: str, chat_id: int):
+        while chat_id in self.active_gif_attacks:
+            gifs = db.get_gifs()
+            if not gifs:
+                time.sleep(0.05)
+                continue
+            gif_file_id = random.choice(gifs)
+            reply_id = self.gif_reply_targets.get(chat_id, None)
+            self.send_gif(token, chat_id, gif_file_id, reply_id=reply_id)
+            time.sleep(self.delay)
+
+    def start_attack(self, chat_id: int, reply_to_msg_id: int = None) -> bool:
+        with self.attack_lock:
+            if chat_id in self.active_attacks:
+                return False
+            if not db.get_targets() or not db.get_insults():
+                return False
+            self.active_attacks.add(chat_id)
+            if reply_to_msg_id:
+                self.reply_targets[chat_id] = reply_to_msg_id
+            elif chat_id in self.reply_targets:
+                del self.reply_targets[chat_id]
+        for token in TOKENS:
+            t = threading.Thread(target=self._attack_worker, args=(token, chat_id), daemon=True)
+            t.start()
+        return True
+
+    def stop_attack(self, chat_id: int) -> bool:
+        with self.attack_lock:
+            if chat_id not in self.active_attacks:
+                return False
+            self.active_attacks.discard(chat_id)
+            self.reply_targets.pop(chat_id, None)
+            return True
+
+    def start_gif_attack(self, chat_id: int, reply_to_msg_id: int = None) -> bool:
+        with self.attack_lock:
+            if chat_id in self.active_gif_attacks:
+                return False
+            if not db.get_gifs():
+                return False
+            self.active_gif_attacks.add(chat_id)
+            if reply_to_msg_id:
+                self.gif_reply_targets[chat_id] = reply_to_msg_id
+            elif chat_id in self.gif_reply_targets:
+                del self.gif_reply_targets[chat_id]
+        for token in TOKENS:
+            t = threading.Thread(target=self._gif_attack_worker, args=(token, chat_id), daemon=True)
+            t.start()
+        return True
+
+    def stop_gif_attack(self, chat_id: int) -> bool:
+        with self.attack_lock:
+            if chat_id not in self.active_gif_attacks:
+                return False
+            self.active_gif_attacks.discard(chat_id)
+            self.gif_reply_targets.pop(chat_id, None)
+            return True
+
+    # --- Command Handlers ---
+    HELP_PANEL = """
+🔰 **𝘼𝙩𝙩𝙖𝙘𝙠 𝘽𝙤𝙩 𝘾𝙤𝙣𝙩𝙧𝙤𝙡 𝙋𝙖𝙣𝙚𝙡** 🔰
+
+🔰 **𝙏𝙖𝙧𝙜𝙚𝙩 𝙈𝙖𝙣𝙖𝙜𝙚𝙢𝙚𝙣𝙩**
+`setid` — 𝗥𝗲𝗽𝗹𝘆 𝘁𝗼 𝘂𝘀𝗲𝗿 𝘁𝗼 𝗮𝗱𝗱 𝘁𝗮𝗿𝗴𝗲𝘁
+`delid` — 𝗥𝗲𝗽𝗹𝘆 𝘁𝗼 𝘂𝘀𝗲𝗿 𝘁𝗼 𝗿𝗲𝗺𝗼𝘃𝗲 𝘁𝗮𝗿𝗴𝗲𝘁
+`delallid` — 𝗖𝗹𝗲𝗮𝗿 𝗮𝗹𝗹 𝘁𝗮𝗿𝗴𝗲𝘁𝘀
+`taglist` — 𝗩𝗶𝗲𝘄 𝘁𝗮𝗿𝗴𝗲𝘁 𝗹𝗶𝘀𝘁
+
+🔰 **𝙀𝙣𝙚𝙢𝙮 𝘼𝙪𝙩𝙤-𝘼𝙩𝙩𝙖𝙘𝙠**
+`setenemy` — 𝗥𝗲𝗽𝗹𝘆 𝘁𝗼 𝘂𝘀𝗲𝗿 𝘁𝗼 𝘀𝗲𝘁 𝗮𝘀 𝗲𝗻𝗲𝗺𝘆
+`delenemy` — 𝗥𝗲𝗽𝗹𝘆 𝘁𝗼 𝘂𝘀𝗲𝗿 𝘁𝗼 𝗿𝗲𝗺𝗼𝘃𝗲 𝗲𝗻𝗲𝗺𝘆
+`enemylist` — 𝗩𝗶𝗲𝘄 𝗲𝗻𝗲𝗺𝘆 𝗹𝗶𝘀𝘁
+
+🔰 **𝙂𝙄𝙁 𝘼𝙩𝙩𝙖𝙘𝙠**
+`savegif` — 𝗥𝗲𝗽𝗹𝘆 𝘁𝗼 𝗮 𝗴𝗶𝗳 𝘁𝗼 𝘀𝗮𝘃𝗲 𝗶𝘁
+`giflist` — 𝗩𝗶𝗲𝘄 𝘀𝗮𝘃𝗲𝗱 𝗴𝗶𝗳𝘀 𝗰𝗼𝘂𝗻𝘁
+`startgif` — 𝗥𝗲𝗽𝗹𝘆 𝘁𝗼 𝘂𝘀𝗲𝗿 𝘁𝗼 𝘀𝗽𝗮𝗺 𝗴𝗶𝗳𝘀
+`stopgif` — 𝗦𝘁𝗼𝗽 𝗴𝗶𝗳 𝘀𝗽𝗮𝗺
+
+🔰 **𝘼𝙙𝙢𝙞𝙣 𝙈𝙖𝙣𝙖𝙜𝙚𝙢𝙚𝙣𝙩** (𝗢𝘄𝗻𝗲𝗿 𝗢𝗻𝗹𝘆)
+`setadmin` — 𝗥𝗲𝗽𝗹𝘆 𝘁𝗼 𝘂𝘀𝗲𝗿 𝘁𝗼 𝗮𝗱𝗱 𝗮𝗱𝗺𝗶𝗻
+`deladmin` — 𝗥𝗲𝗽𝗹𝘆 𝘁𝗼 𝘂𝘀𝗲𝗿 𝘁𝗼 𝗿𝗲𝗺𝗼𝘃𝗲 𝗮𝗱𝗺𝗶𝗻
+`adminlist` — 𝗩𝗶𝗲𝘄 𝗮𝗱𝗺𝗶𝗻 𝗹𝗶𝘀𝘁
+
+🔰 **𝙄𝙣𝙨𝙪𝙡𝙩 𝙈𝙖𝙣𝙖𝙜𝙚𝙢𝙚𝙣𝙩**
+`addinsult text` — 𝗔𝗱𝗱 𝗶𝗻𝘀𝘂𝗹𝘁
+`upload` — 𝗥𝗲𝗽𝗹𝘆 𝘁𝗼 .𝘁𝘅𝘁 𝗳𝗶𝗹𝗲 𝘁𝗼 𝗯𝘂𝗹𝗸 𝗮𝗱𝗱
+`insults` — 𝗩𝗶𝗲𝘄 𝗶𝗻𝘀𝘂𝗹𝘁 𝗹𝗶𝘀𝘁
+`clearinsults` — 𝗖𝗹𝗲𝗮𝗿 𝗮𝗹𝗹 𝗶𝗻𝘀𝘂𝗹𝘁𝘀
+
+🔰 **𝘼𝙩𝙩𝙖𝙘𝙠 𝙎𝙚𝙩𝙩𝙞𝙣𝙜𝙨**
+`settag word` — 𝗦𝗲𝘁 𝗺𝗲𝗻𝘁𝗶𝗼𝗻 𝘁𝗮𝗴
+`settime seconds` — 𝗦𝗲𝘁 𝗱𝗲𝗹𝗮𝘆 𝗽𝗲𝗿 𝗯𝗼𝘁
+`start` — 𝗟𝗮𝘂𝗻𝗰𝗵 𝗮𝘁𝘁𝗮𝗰𝗸 (𝗿𝗲𝗽𝗹𝘆 𝗳𝗼𝗿 𝗿𝗲𝗽𝗹𝘆 𝗺𝗼𝗱𝗲)
+`stop` — 𝗦𝘁𝗼𝗽 𝗮𝘁𝘁𝗮𝗰𝗸 𝗶𝗺𝗺𝗲𝗱𝗶𝗮𝘁𝗲𝗹𝘆
+
+🔰 **𝙎𝙮𝙨𝙩𝙚𝙢**
+`ping` — 𝗖𝗵𝗲𝗰𝗸 𝗿𝗲𝘀𝗽𝗼𝗻𝘀𝗲 𝘁𝗶𝗺𝗲
+`bot` — 𝗩𝗶𝗲𝘄 𝗯𝗼𝘁 𝘀𝘁𝗮𝘁𝘂𝘀
+`help` — 𝗦𝗵𝗼𝘄 𝘁𝗵𝗶𝘀 𝗽𝗮𝗻𝗲𝗹
+"""
+
+    def process_update(self, token: str, msg: dict):
+        chat_id = msg["chat"]["id"]
+        user_id = msg["from"]["id"]
+        text = msg.get("text", "")
+        msg_id = msg.get("message_id")
+        reply = msg.get("reply_to_message")
+        document = msg.get("document")
+        animation = msg.get("animation")
+
+        if not self._is_authorized(user_id):
+            if db.is_enemy(user_id):
+                has_content = (
+                    text or msg.get("caption") or msg.get("sticker") or 
+                    msg.get("photo") or msg.get("video") or animation or 
+                    msg.get("document") or msg.get("audio") or msg.get("voice") or 
+                    msg.get("video_note") or msg.get("contact") or 
+                    msg.get("location") or msg.get("poll")
+                )
+                if has_content:
+                    self._trigger_enemy_attack(chat_id, user_id, msg_id)
+            return
+
+        cmd = text.strip().lower()
+
+        # --- General Commands ---
+        if cmd == "help":
+            self.send_msg(token, chat_id, self.HELP_PANEL)
+            return
+
+        if cmd == "ping":
+            start = time.time()
+            self.send_msg(token, chat_id, "✦ **𝙿𝙾𝙽𝙶** ✦")
+            ping_time = int((time.time() - start) * 1000)
+            self.send_msg(token, chat_id, f"✦ **{ping_time}𝚖𝚜** ✦")
+            return
+
+        if cmd == "bot":
+            self.send_msg(token, chat_id, "✦ **𝙾𝙽𝙻𝙸𝙽𝙴** ✦", reply_id=msg_id)
+            return
+
+        # --- GIF Commands ---
+        if cmd == "savegif":
+            gif_file_id = None
+            if animation:
+                gif_file_id = animation["file_id"]
+            elif reply and reply.get("animation"):
+                gif_file_id = reply["animation"]["file_id"]
+            if gif_file_id:
+                db.add_gif(gif_file_id)
+            return
+
+        if cmd == "giflist":
+            gifs = db.get_gifs()
+            self.send_msg(token, chat_id, f"✦ **{len(gifs)} 𝙶𝙸𝙵𝚂** ✦")
+            return
+
+        if cmd == "startgif":
+            if reply:
+                reply_to = reply["message_id"]
+            else:
+                reply_to = None
+            self.start_gif_attack(chat_id, reply_to)
+            return
+
+        if cmd == "stopgif":
+            self.stop_gif_attack(chat_id)
+            return
+
+        # --- Admin Commands ---
+        if cmd == "setadmin" and user_id == OWNER_ID:
+            if reply:
+                db.add_admin(reply["from"]["id"])
+            return
+
+        if cmd == "deladmin" and user_id == OWNER_ID:
+            if reply:
+                db.remove_admin(reply["from"]["id"])
+            return
+
+        if cmd == "adminlist" and user_id == OWNER_ID:
+            admins = db.get_admins()
+            if not admins:
+                self.send_msg(token, chat_id, "✦ **𝙽𝙾 𝙰𝙳𝙼𝙸𝙽𝚂** ✦")
+                return
+            txt = f"**𝙰𝚍𝚖𝚒𝚗 𝙻𝚒𝚜𝚝 ({len(admins)})**\n"
+            for uid in admins:
+                txt += f"• `{uid}`\n"
+            self.send_msg(token, chat_id, txt)
+            return
+
+        # --- Enemy Commands ---
+        if cmd == "setenemy":
+            if reply:
+                if db.add_enemy(reply["from"]["id"]):
+                    self.send_msg(token, chat_id, "✦ **𝙴𝙽𝙴𝙼𝚈 𝙰𝙳𝙳𝙴𝙳** ✦")
+                else:
+                    self.send_msg(token, chat_id, "✦ **𝙰𝙻𝚁𝙴𝙰𝙳𝚈 𝙴𝙽𝙴𝙼𝚈** ✦")
+            return
+
+        if cmd == "delenemy":
+            if reply:
+                if db.remove_enemy(reply["from"]["id"]):
+                    self.send_msg(token, chat_id, "✦ **𝙴𝙽𝙴𝙼𝚈 𝚁𝙴𝙼𝙾𝚅𝙴𝙳** ✦")
+                else:
+                    self.send_msg(token, chat_id, "✦ **𝙽𝙾𝚃 𝙵𝙾𝚄𝙽𝙳** ✦")
+            return
+
+        if cmd == "enemylist":
+            enemies = db.get_enemies()
+            if not enemies:
+                self.send_msg(token, chat_id, "✦ **𝙽𝙾 𝙴𝙽𝙴𝙼𝙸𝙴𝚂** ✦")
+                return
+            txt = f"**𝙴𝚗𝚎𝚖𝚢 𝙻𝚒𝚜𝚝 ({len(enemies)})**\n"
+            for uid in enemies:
+                txt += f"• [{self.tag_symbol}](tg://user?id={uid}) `{uid}`\n"
+            self.send_msg(token, chat_id, txt)
+            return
+
+        # --- Target Commands ---
+        if cmd == "setid":
+            if reply:
+                if db.add_target(reply["from"]["id"]):
+                    self.send_msg(token, chat_id, "✦ **𝚃𝙰𝚁𝙶𝙴𝚃 𝙰𝙳𝙳𝙴𝙳** ✦")
+                else:
+                    self.send_msg(token, chat_id, "✦ **𝙰𝙻𝚁𝙴𝙰𝙳𝚈 𝙸𝙽 𝙻𝙸𝚂𝚃** ✦")
+            return
+
+        if cmd == "delid":
+            if reply:
+                if db.remove_target(reply["from"]["id"]):
+                    self.send_msg(token, chat_id, "✦ **𝚃𝙰𝚁𝙶𝙴𝚃 𝚁𝙴𝙼𝙾𝚅𝙴𝙳** ✦")
+                else:
+                    self.send_msg(token, chat_id, "✦ **𝙽𝙾𝚃 𝙵𝙾𝚄𝙽𝙳** ✦")
+            return
+
+        if cmd == "delallid":
+            count = len(db.get_targets())
+            db.clear_targets()
+            self.send_msg(token, chat_id, f"✦ **{count} 𝚃𝙰𝚁𝙶𝙴𝚃𝚂 𝙲𝙻𝙴𝙰𝚁𝙴𝙳** ✦")
+            return
+
+        if cmd == "taglist":
+            targets = db.get_targets()
+            if not targets:
+                self.send_msg(token, chat_id, "✦ **𝙽𝙾 𝚃𝙰𝚁𝙶𝙴𝚃𝚂** ✦")
+                return
+            txt = f"**𝚃𝚊𝚛𝚐𝚎𝚝 𝙻𝚒𝚜𝚝 ({len(targets)})**\n"
+            for uid in targets:
+                txt += f"• [{self.tag_symbol}](tg://user?id={uid}) `{uid}`\n"
+            self.send_msg(token, chat_id, txt)
+            return
+
+        # --- Insult Commands ---
+        if cmd.startswith("addinsult "):
+            parts = text.split(maxsplit=1)
+            if len(parts) > 1 and parts[1].strip():
+                if db.add_insult(parts[1]):
+                    self.send_msg(token, chat_id, "✦ **𝙸𝙽𝚂𝚄𝙻𝚃 𝙰𝙳𝙳𝙴𝙳** ✦")
+                else:
+                    self.send_msg(token, chat_id, "✦ **𝙰𝙻𝚁𝙴𝙰𝙳𝚈 𝙴𝚇𝙸𝚂𝚃𝚂** ✦")
+            return
+
+        if cmd == "upload":
+            file_doc = document
+            if reply and reply.get("document"):
+                file_doc = reply["document"]
+            if file_doc:
+                content = self.download_file_content(token, file_doc["file_id"])
+                if content:
+                    lines = [line.strip() for line in content.split('\n') if line.strip()]
+                    added = db.add_insults_bulk(lines)
+                    self.send_msg(token, chat_id, f"✦ **{added} 𝙰𝙳𝙳𝙴𝙳** ✦")
+            return
+
+        if cmd == "insults":
+            insults = db.get_insults()
+            if not insults:
+                self.send_msg(token, chat_id, "✦ **𝙽𝙾 𝙸𝙽𝚂𝚄𝙻𝚃𝚂** ✦")
+                return
+            txt = f"**𝙸𝚗𝚜𝚞𝚕𝚝 𝙻𝚒𝚜𝚝 ({len(insults)})**\n"
+            for i, ins in enumerate(insults, 1):
+                txt += f"{i}. {ins}\n"
+            self.send_msg(token, chat_id, txt)
+            return
+
+        if cmd == "clearinsults":
+            db.clear_insults()
+            self.send_msg(token, chat_id, "✦ **𝙲𝙻𝙴𝙰𝚁𝙴𝙳** ✦")
+            return
+
+        # --- Settings Commands ---
+        if cmd.startswith("settag "):
+            parts = text.split(maxsplit=1)
+            if len(parts) > 1 and parts[1].strip():
+                self.tag_symbol = parts[1].strip()
+                db.set_setting("tag", self.tag_symbol)
+                self.send_msg(token, chat_id, f"✦ **𝚃𝙰𝙶 𝚂𝙴𝚃: {self.tag_symbol}** ✦")
+            return
+
+        if cmd.startswith("settime "):
+            parts = text.split(maxsplit=1)
+            if len(parts) > 1:
+                try:
+                    new_delay = float(parts[1])
+                    if new_delay <= 0:
+                        raise ValueError
+                    self.delay = new_delay
+                    db.set_setting("delay", str(self.delay))
+                    self.send_msg(token, chat_id, f"✦ **𝙳𝙴𝙻𝙰𝚈 𝚂𝙴𝚃: {self.delay}𝚜** ✦")
+                except ValueError:
+                    pass
+            return
+
+        if cmd == "start":
+            reply_to = reply["message_id"] if reply else None
+            self.start_attack(chat_id, reply_to)
+            return
+
+        if cmd == "stop":
+            self.stop_attack(chat_id)
+            return
+
+# ============================================================
+# Polling Runner
+# ============================================================
+def polling_worker(token: str, bot_num: int, master: MasterBot):
+    log.info(f"Bot-{bot_num} polling started.")
+    threading.Thread(target=master._enemy_worker, args=(token,), daemon=True).start()
+    offset = None
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{token}/getUpdates"
+            params = {"timeout": 15, "allowed_updates": ["message"]}
+            if offset:
+                params["offset"] = offset
+            response = requests.get(url, params=params, timeout=20)
+            if response.status_code != 200:
+                time.sleep(1)
+                continue
+            updates = response.json().get("result", [])
+            for update in updates:
+                offset = update["update_id"] + 1
+                if "message" in update:
+                    threading.Thread(
+                        target=master.process_update,
+                        args=(token, update["message"]),
+                        daemon=True
+                    ).start()
+        except Exception as e:
+            log.error(f"Bot-{bot_num} polling error: {e}")
+            time.sleep(2)
+
+# ============================================================
+# Main Entry Point
+# ============================================================
+if __name__ == "__main__":
+    log.info("=== Starting Attack System ===")
+    master = MasterBot()
+    for i, token in enumerate(TOKENS, 1):
+        t = threading.Thread(target=polling_worker, args=(token, i, master), daemon=True)
+        t.start()
+        time.sleep(0.2)
+    log.info(f"All {len(TOKENS)} bots are operational.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("Shutdown signal received. Stopping...")
